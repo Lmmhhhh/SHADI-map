@@ -180,7 +180,8 @@ for _, r in trees_gdf.iterrows():
     lat, lon  = r["위도"], r["경도"]
     h         = float(r.get("수고", 4))          # 수고 없으면 4 m
     crown_r   = h * 0.25                        # 수관 반경 ≈ 높이 1/4
-    alt, azi  = get_altitude(lat, lon, now), get_azimuth(lat, lon, now)
+    # ⬇⬇⬇ azimuth 180도 반전
+    alt, azi  = get_altitude(lat, lon, now), (get_azimuth(lat, lon, now) + 180) % 360
 
     poly = tree_shadow_ellipse(lat, lon, crown_r, alt, azi)  
     if poly.is_empty: continue
@@ -216,7 +217,8 @@ for _, r in shp_gdf.iterrows():
     if poly.is_empty: continue
     floors = pd.to_numeric(r.get("A25"), errors="coerce")
     h      = floors*3 if not pd.isna(floors) else 10.0
-    alt, azi = get_altitude(poly.centroid.y, poly.centroid.x, now), get_azimuth(poly.centroid.y, poly.centroid.x, now)
+    # ⬇⬇⬇ azimuth 180도 반전
+    alt, azi = get_altitude(poly.centroid.y, poly.centroid.x, now), (get_azimuth(poly.centroid.y, poly.centroid.x, now) + 180) % 360
     s_poly  = building_shadow_polygon(poly, h, alt, azi)
     if not s_poly.is_valid or s_poly.is_empty: continue
     shp_layers.append((s_poly, f"Shapefile<br>높이≈{h:.1f} m"))
@@ -236,7 +238,8 @@ for _, r in shel_gdf.iterrows():
     if shelter_h is None: shelter_h = 3.0
     if canopy_d  is None: canopy_d  = 3.0
 
-    alt, azi = get_altitude(lat, lon, now), get_azimuth(lat, lon, now)
+    # ⬇⬇⬇ azimuth 180도 반전
+    alt, azi = get_altitude(lat, lon, now), (get_azimuth(lat, lon, now) + 180) % 360
     # diameter_m=canopy_d, height_m=shelter_h 순으로 인자 전달
     poly = shelter_shadow_octagon(lat, lon, canopy_d, shelter_h, alt, azi)
 
@@ -276,7 +279,8 @@ for _, row in osm.iterrows():
         candidates = [h for h in (h_height, h_levels) if h is not None]
         h = max(candidates) if candidates else 10.0
 
-    alt, azi = get_altitude(poly.centroid.y, poly.centroid.x, now), get_azimuth(poly.centroid.y, poly.centroid.x, now)
+    # ⬇⬇⬇ azimuth 180도 반전
+    alt, azi = get_altitude(poly.centroid.y, poly.centroid.x, now), (get_azimuth(poly.centroid.y, poly.centroid.x, now) + 180) % 360
     
     if (poly.is_empty or poly.intersects(shp_union) or
         not isinstance(poly, (Polygon, MultiPolygon))):
@@ -318,7 +322,8 @@ tree_fg = folium.FeatureGroup(name="🌳 나무 그림자", show=True)
 for _, r in trees_gdf.iterrows():
     lat, lon = r["위도"], r["경도"]
     # 고정 높이 10m, 수관폭 6m 적용
-    alt, azi = get_altitude(lat, lon, now), get_azimuth(lat, lon, now)
+    # ⬇⬇⬇ azimuth 180도 반전
+    alt, azi = get_altitude(lat, lon, now), (get_azimuth(lat, lon, now) + 180) % 360
     poly = tree_shadow_ellipse(lat, lon, 6/2, alt, azi)
     if poly.is_empty: continue
     folium.GeoJson(
@@ -341,8 +346,9 @@ for _, r in shel_gdf.iterrows():
     shelter_h = to_float_or_none(r.get("전체높이")) or 2.5
     canopy_d  = to_float_or_none(r.get("펼침지름")) or 2.0
 
+    # ⬇⬇⬇ azimuth 180도 반전
     alt = get_altitude(lat, lon, now)
-    azi = get_azimuth(lat, lon, now)
+    azi = (get_azimuth(lat, lon, now) + 180) % 360
     poly = shelter_shadow_octagon(lat, lon, canopy_d, shelter_h, alt, azi)
     if poly.is_empty:
         continue
