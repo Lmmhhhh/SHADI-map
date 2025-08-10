@@ -62,3 +62,12 @@ sudo -u postgres psql -d shadi -c "\dx"
  postgis   | 3.4.2   | public     | PostGIS geometry and geography spatial types and functions
 (3 rows)
 ```
+
+# 도로 네트워크 적재 
+``` bash
+pip install sqlalchemy psycopg2-binary
+```
+
+``` bash
+python load_yuseong_to_postgis.py
+```
