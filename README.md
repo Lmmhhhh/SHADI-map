@@ -71,3 +71,40 @@ pip install sqlalchemy psycopg2-binary
 ``` bash
 python load_yuseong_to_postgis.py
 ```
+
+# 테이블 생성 - 터미널에 입력
+``` bash
+sudo -u postgres psql -d shadi
+```
+
+``` bash
+-- 3-0 geometry 타입을 확실히 LineString으로(혹시 모를 혼합형 대비)
+ALTER TABLE ways_raw
+  ALTER COLUMN geom TYPE geometry(LineString,4326)
+  USING ST_LineMerge(ST_CollectionExtract(geom,2));
+
+-- 3-1 PK 보장
+ALTER TABLE ways_raw ADD COLUMN IF NOT EXISTS id bigserial;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ways_raw_pkey') THEN
+    ALTER TABLE ways_raw ADD CONSTRAINT ways_raw_pkey PRIMARY KEY (id);
+  END IF;
+END$$;
+
+-- 3-2 pgRouting 토폴로지
+SELECT pgr_createTopology('ways_raw', 0.00001, 'geom', 'id');
+
+-- 3-3 성능 인덱스
+CREATE INDEX IF NOT EXISTS ways_raw_geom_gix   ON ways_raw USING GIST (geom);
+CREATE INDEX IF NOT EXISTS ways_raw_source_idx ON ways_raw(source);
+CREATE INDEX IF NOT EXISTS ways_raw_target_idx ON ways_raw(target);
+
+-- 3-4 기본 길이/코스트
+ALTER TABLE ways_raw ADD COLUMN IF NOT EXISTS len_m double precision;
+UPDATE ways_raw SET len_m = ST_Length(ST_Transform(geom,5179));
+
+ALTER TABLE ways_raw ADD COLUMN IF NOT EXISTS cost double precision;
+ALTER TABLE ways_raw ADD COLUMN IF NOT EXISTS reverse_cost double precision;
+UPDATE ways_raw SET cost = len_m, reverse_cost = len_m;
+```

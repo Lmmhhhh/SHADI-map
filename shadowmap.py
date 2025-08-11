@@ -12,7 +12,7 @@ from shapely.affinity import scale, rotate
 
 # ────────────────────────────── 기본 설정 ──────────────────────────────
 tz   = pytz.timezone("Asia/Seoul")
-now  = tz.localize(datetime.datetime(2024, 7, 31, 18, 0, 0))   # 분석 시각
+now  = tz.localize(datetime.datetime(2024, 7, 31, 9, 0, 0))   # 분석 시각
 WIDTH_RATIO_TREE = 7                                         # 나무 그림자 폭 = 높이×1.5
 proj = Transformer.from_crs(4326, 5179, always_xy=True)        # 면적(m²) 계산용
 SHELTER_SCALE = 3                                            # 쉼터 그림자 폭
@@ -374,5 +374,5 @@ m.add_child(shelter_fg)
 folium.LayerControl(collapsed=False).add_to(m)
  
 # 결과 저장
-m.save("shadow_map_pretty_18.html")
-print("shadow_map_pretty_18.html 저장 완료")
+m.save("shadow_map_pretty_9.html")
+print("shadow_map_pretty_9.html 저장 완료")
