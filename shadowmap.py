@@ -12,7 +12,7 @@ from shapely.affinity import scale, rotate
 
 # ────────────────────────────── 기본 설정 ──────────────────────────────
 tz   = pytz.timezone("Asia/Seoul")
-now  = tz.localize(datetime.datetime(2024, 7, 31, 9, 0, 0))   # 분석 시각
+now  = tz.localize(datetime.datetime(2024, 7, 31, 15, 0, 0))   # 분석 시각
 WIDTH_RATIO_TREE = 7                                         # 나무 그림자 폭 = 높이×1.5
 proj = Transformer.from_crs(4326, 5179, always_xy=True)        # 면적(m²) 계산용
 SHELTER_SCALE = 3                                            # 쉼터 그림자 폭
@@ -365,14 +365,223 @@ for _, r in shel_gdf.iterrows():
     ).add_to(shelter_fg)
 
 
-# ─────────────────────────────────────────────────────────────────────
-# 생성해둔 FeatureGroup을 최종 맵에 붙이기
-m.add_child(bld_fg)
-m.add_child(tree_fg)
-m.add_child(shelter_fg)
+# ───────────────────── 4. PostGIS 저장 (추가) ─────────────────────
+from sqlalchemy import create_engine, text
 
+# 4-0) Postgres 접속 정보 (환경에 맞게 수정)
+PG_URL = "postgresql://postgres:804009@localhost:5432/shadi"
+engine = create_engine(PG_URL)
+
+# 4-1) GeoDataFrame 준비
+#  - 각 레이어에서 geometry만 뽑아 테이블로 저장
+gdf_building = gpd.GeoDataFrame(
+    geometry=[g for g, _ in (shp_layers + osm_layers)],
+    crs="EPSG:4326"
+)
+gdf_tree = gpd.GeoDataFrame(
+    geometry=[g for g, _ in tree_layers],
+    crs="EPSG:4326"
+)
+gdf_shelter = gpd.GeoDataFrame(
+    geometry=[g for g, _ in shel_layers],
+    crs="EPSG:4326"
+)
+
+# 4-2) PostGIS로 저장 (없으면 생성, 있으면 교체)
+gdf_building.to_postgis("shadow_building_20240731_1500", engine, if_exists="replace", index=False)
+gdf_tree.to_postgis("shadow_tree_20240731_1500", engine, if_exists="replace", index=False)
+gdf_shelter.to_postgis("shadow_shelter_20240731_1500", engine, if_exists="replace", index=False)
+
+# 4-3) 공간 인덱스 생성
+with engine.begin() as conn:
+    conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS shadow_building_20240731_1500_gix
+          ON shadow_building_20240731_1500 USING GIST (geometry);
+        CREATE INDEX IF NOT EXISTS shadow_tree_20240731_1500_gix
+          ON shadow_tree_20240731_1500 USING GIST (geometry);
+        CREATE INDEX IF NOT EXISTS shadow_shelter_20240731_1500_gix
+          ON shadow_shelter_20240731_1500 USING GIST (geometry);
+    """))
+
+# 4-4) UNION 테이블 생성 (건물+나무+쉼터)
+with engine.begin() as conn:
+    conn.execute(text("DROP TABLE IF EXISTS shadow_union_20240731_1500;"))
+    conn.execute(text("""
+        CREATE TABLE shadow_union_20240731_1500 AS
+        SELECT ST_UnaryUnion(geometry) AS geometry
+        FROM (
+          SELECT geometry FROM shadow_building_20240731_1500
+          UNION ALL
+          SELECT geometry FROM shadow_tree_20240731_1500
+          UNION ALL
+          SELECT geometry FROM shadow_shelter_20240731_1500
+        ) s;
+    """))
+    conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS shadow_union_20240731_1500_gix
+          ON shadow_union_20240731_1500 USING GIST (geometry);
+    """))
+
+print("PostGIS 저장 및 UNION 테이블 생성 완료")
+
+# ───────────────────── 5. 경로 산출(최단/시원길) + 지도 레이어 추가 ─────────────────────
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+# (1) 출발/도착 좌표 설정 (lon, lat)  ← 필요에 맞게 바꾸세요
+SRC = (127.346442, 36.365188)   # 예시: 공릉천 인근
+DST = (127.343051, 36.368850)   # 예시: 유성온천역 쪽
+
+# (2) ‘시원길’ 가중치: 그늘 비율이 높을수록 비용을 더 낮게(선호) 만드는 계수
+COOL_WEIGHT = 0.8   # 0.0~1.0 권장. 1.0이면 그늘 100% 구간 비용이 거의 0에 가까워짐
+
+# (3) 경로 계산용 SQL (해당 시각: 2024-07-31 15:00 → union 테이블: shadow_union_20240731_1500)
+#     - len_m: 실제 edge 길이(m)
+#     - shade_ratio: edge의 그늘 비율(0~1), union 폴리곤과의 교차 길이 / 전체 길이
+#     - cool_cost: len_m * (1 - COOL_WEIGHT * shade_ratio)  → 그늘 많을수록 더 작은 비용
+SQL_ROUTE = f"""
+WITH
+u AS (
+  SELECT geometry FROM shadow_union_20240731_1500 LIMIT 1
+),
+edges AS (
+  SELECT
+    w.id, w.source, w.target, w.geom,
+    ST_Length(w.geom::geography) AS len_m,
+    COALESCE(
+      ST_Length(ST_Intersection(w.geom::geography, u.geometry::geography))
+      / NULLIF(ST_Length(w.geom::geography), 0), 0
+    ) AS shade_ratio
+  FROM ways_raw w
+  LEFT JOIN u ON ST_Intersects(w.geom, u.geometry)
+),
+src AS (
+  SELECT id
+  FROM ways_raw_vertices_pgr
+  ORDER BY the_geom <-> ST_SetSRID(ST_Point(%s,%s), 4326)
+  LIMIT 1
+),
+dst AS (
+  SELECT id
+  FROM ways_raw_vertices_pgr
+  ORDER BY the_geom <-> ST_SetSRID(ST_Point(%s,%s), 4326)
+  LIMIT 1
+),
+shortest AS (
+  SELECT * FROM pgr_dijkstra(
+    --[수정] 바깥 CTE(edges) 참조 금지 → 내부에서 길이 계산 Subquery로 직접 작성
+    $q$
+    SELECT id, source, target,
+           len_m AS cost,
+           len_m AS reverse_cost
+    FROM (
+      SELECT
+        w.id, w.source, w.target, w.geom,
+        ST_Length(w.geom::geography) AS len_m
+      FROM ways_raw w
+    ) AS in_edges
+    $q$,
+    (SELECT id FROM src), (SELECT id FROM dst),
+    false
+  )
+),
+coolest AS (
+  SELECT * FROM pgr_dijkstra(
+    -- [수정] 바깥 CTE(edges) 참조 금지 → 내부에서 shade_ratio까지 직접 계산
+    $q$
+    SELECT
+      id, source, target,
+      GREATEST(len_m * (1 - {COOL_WEIGHT} * shade_ratio), 0.1) AS cost,
+      GREATEST(len_m * (1 - {COOL_WEIGHT} * shade_ratio), 0.1) AS reverse_cost
+    FROM (
+      SELECT
+        w.id, w.source, w.target, w.geom,
+        ST_Length(w.geom::geography) AS len_m,
+        --  내부에서 바로 그늘비율 계산: union 테이블 직접 JOIN
+        COALESCE(
+          ST_Length(ST_Intersection(w.geom::geography, su.geometry::geography))
+          / NULLIF(ST_Length(w.geom::geography), 0), 0
+        ) AS shade_ratio
+      FROM ways_raw w
+      LEFT JOIN shadow_union_20240731_1500 su
+        ON ST_Intersects(w.geom, su.geometry)
+    ) AS in_edges
+    $q$,
+    (SELECT id FROM src), (SELECT id FROM dst),
+    false
+  )
+),
+shortest_path AS (
+  SELECT
+    ST_LineMerge(ST_Union(e.geom)) AS geom,
+    SUM(e.len_m) AS total_m,
+    AVG(e.shade_ratio) AS avg_shade_ratio
+  FROM shortest s
+  JOIN edges e ON s.edge = e.id
+  WHERE s.edge <> -1
+),
+coolest_path AS (
+  SELECT
+    ST_LineMerge(ST_Union(e.geom)) AS geom,
+    SUM(e.len_m) AS total_m,
+    AVG(e.shade_ratio) AS avg_shade_ratio
+  FROM coolest c
+  JOIN edges e ON c.edge = e.id
+  WHERE c.edge <> -1
+)
+SELECT
+  'shortest' AS kind,
+  ST_AsGeoJSON(geom) AS gj,
+  total_m,
+  avg_shade_ratio
+FROM shortest_path
+UNION ALL
+SELECT
+  'coolest' AS kind,
+  ST_AsGeoJSON(geom) AS gj,
+  total_m,
+  avg_shade_ratio
+FROM coolest_path;
+"""
+
+def _fetch_routes(conn_dsn, src, dst):
+    with psycopg2.connect(conn_dsn) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(SQL_ROUTE, (src[0], src[1], dst[0], dst[1]))
+        rows = cur.fetchall()
+        routes = {r["kind"]: r for r in rows}
+        return routes
+
+print("  • 경로 계산(pgr_dijkstra) 수행 중 …")
+routes = _fetch_routes(PG_URL, SRC, DST)
+
+# (4) Folium 레이어로 추가(지도 m는 기존에 생성된 객체를 재사용)
+route_fg = folium.FeatureGroup(name="🗺️ 경로(15:00)", show=True)
+
+# 출발/도착 마커
+folium.Marker((SRC[1], SRC[0]), tooltip="출발", icon=folium.Icon(color="green")).add_to(route_fg)
+folium.Marker((DST[1], DST[0]), tooltip="도착", icon=folium.Icon(color="red")).add_to(route_fg)
+
+# 최단 경로
+r_min = routes.get("shortest")
+if r_min and r_min["gj"]:
+    folium.GeoJson(
+        r_min["gj"],
+        name=f"📏 최단 • {r_min['total_m']:.0f} m • shade {(r_min['avg_shade_ratio'] or 0)*100:.1f}%",
+        style_function=lambda _:{ "color":"#333333", "weight":6, "opacity":0.95 }
+    ).add_to(route_fg)
+
+# 시원길(그늘 최대 선호)
+r_cool = routes.get("coolest")
+if r_cool and r_cool["gj"]:
+    folium.GeoJson(
+        r_cool["gj"],
+        name=f"🧊 시원길 • {r_cool['total_m']:.0f} m • shade {(r_cool['avg_shade_ratio'] or 0)*100:.1f}%",
+        style_function=lambda _:{ "color":"#225ea8", "weight":6, "opacity":0.95 }
+    ).add_to(route_fg)
+
+m.add_child(route_fg)
 folium.LayerControl(collapsed=False).add_to(m)
- 
-# 결과 저장
-m.save("shadow_map_pretty_9.html")
-print("shadow_map_pretty_9.html 저장 완료")
+
+# (5) 추가 저장본(경로 포함)
+m.save("shadow_map_pretty_15_with_routes.html")
+print("shadow_map_pretty_15_with_routes.html 저장 완료")
