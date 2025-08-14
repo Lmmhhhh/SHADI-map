@@ -284,41 +284,34 @@ def _fast_copy_gdf(gdf: gpd.GeoDataFrame, table_name: str, srid: int = 4326):
     import io, psycopg2
     from psycopg2.extras import execute_batch
 
-    # 비어있는/결측 기하 제거
     gdf = gdf[ gdf.geometry.notna() & (~gdf.geometry.is_empty) ].copy()
 
     with psycopg2.connect(PG_URL) as conn, conn.cursor() as cur:
-        # 트랜잭션 한정 속도 옵션
         cur.execute("SET LOCAL synchronous_commit = OFF;")
         cur.execute("SET LOCAL jit = OFF;")
         cur.execute("SET LOCAL work_mem = '256MB';")
         cur.execute("SET LOCAL maintenance_work_mem = '1GB';")
 
-        # 타깃 테이블을 UNLOGGED로 새로 만들고(쓰기 빠름) geometry 컬럼만 둠
         cur.execute(f"DROP TABLE IF EXISTS {table_name};")
         cur.execute(f"CREATE UNLOGGED TABLE {table_name} (geometry geometry(Geometry,{srid}));")
 
-        # 임시 테이블(텍스트 HEX) 만들고 COPY로 대량 적재
         cur.execute("CREATE TEMP TABLE _tmp_wkb (wkb_hex text);")
         buf = io.StringIO()
         pd.Series(gdf.geometry.apply(lambda g: g.wkb_hex)).to_csv(buf, index=False, header=False)
         buf.seek(0)
         cur.copy_from(buf, '_tmp_wkb', sep=',')
 
-        # HEX → geometry 변환하여 타깃으로 삽입
         cur.execute(f"""
             INSERT INTO {table_name}(geometry)
             SELECT ST_SetSRID(ST_GeomFromWKB(decode(wkb_hex,'hex')),{srid})
             FROM _tmp_wkb;
         """)
 
-# ▶ 여기 세 줄이 기존 to_postgis 3줄을 대체
 _fast_copy_gdf(gdf_building, "shadow_building_20240731_1800")
 _fast_copy_gdf(gdf_tree,     "shadow_tree_20240731_1800")
 _fast_copy_gdf(gdf_shelter,  "shadow_shelter_20240731_1800")
 
 with engine.begin() as conn:
-    # (그대로 유지) 인덱스 생성 및 유니온 테이블 생성
     conn.exec_driver_sql("""
         SET LOCAL synchronous_commit = OFF;
         SET LOCAL jit = OFF;
@@ -339,7 +332,6 @@ with engine.begin() as conn:
     conn.execute(text("""
         CREATE UNLOGGED TABLE shadow_union_20240731_1800 AS
         WITH all_shadows AS (
-          -- 각 테이블별: 4326 → 5179, 스냅, 유효화, 0버퍼, 폴리곤만 추출
           SELECT ST_CollectionExtract(
                    ST_Buffer(
                      ST_MakeValid(
@@ -390,138 +382,146 @@ print("PostGIS 저장 및 UNION 테이블 생성 완료")
 # 5) 경로 산출(ways_walk 사용)
 import psycopg2
 from psycopg2.extras import RealDictCursor
-SRC = (127.345532,36.364655)  # (lon, lat) 36.364655, 127.345532
-DST = (127.343630, 36.370917) # (lon, lat) 36.370917, 127.343630
+SRC = (127.345532,36.364655)  # (lon, lat)
+DST = (127.343630,36.370917)  # (lon, lat)
 COOL_WEIGHT = 0.8
 
-# 보행폭 2.5m 버퍼 + 사전 유니온된 단일 그림자 기하 사용(기능 동일, 비용 ↓)
-SQL_ROUTE = f"""
-WITH
-u AS (
-  SELECT geometry FROM shadow_union_20240731_1800 LIMIT 1
-),
-edges AS (
-  SELECT
-    w.id, w.source, w.target, w.geom, w.len_m,
-    LEAST(
-      COALESCE(
-        ST_Area(
-          ST_Intersection(
-            ST_MakeValid(ST_Buffer(ST_Transform(w.geom, 5179), 2.5)),      -- 보행폭 2.5 m
-            ST_MakeValid(ST_Transform((SELECT geometry FROM u), 5179))
-          )
-        ) / NULLIF(
-          ST_Area(ST_MakeValid(ST_Buffer(ST_Transform(w.geom, 5179), 2.5))), 0
-        ),
-        0
-      ),
-      1.0
-    ) AS shade_ratio
-  FROM ways_walk w, u
-  WHERE ST_DWithin(w.geom::geography, u.geometry::geography, 20)
-),
-src AS (
-  SELECT v.id
-  FROM ways_raw_vertices_pgr v
-  JOIN (
-    SELECT source AS vid FROM ways_walk
-    UNION
-    SELECT target AS vid FROM ways_walk
-  ) ok ON ok.vid = v.id
-  ORDER BY v.the_geom <-> ST_SetSRID(ST_Point(%s,%s), 4326)
-  LIMIT 1
-),
-dst AS (
-  SELECT v.id
-  FROM ways_raw_vertices_pgr v
-  JOIN (
-    SELECT source AS vid FROM ways_walk
-    UNION
-    SELECT target AS vid FROM ways_walk
-  ) ok ON ok.vid = v.id
-  ORDER BY v.the_geom <-> ST_SetSRID(ST_Point(%s,%s), 4326)
-  LIMIT 1
-),
-shortest AS (
-  SELECT * FROM pgr_dijkstra(
-    $q$
-    SELECT id, source, target, len_m AS cost, len_m AS reverse_cost
-    FROM ways_walk
-    $q$,
-    (SELECT id FROM src), (SELECT id FROM dst), false
-  )
-),
-coolest AS (
-  SELECT * FROM pgr_dijkstra(
-    $q$
-    SELECT
-      w.id, w.source, w.target,
-      GREATEST(
-        w.len_m * (1 - {COOL_WEIGHT} * LEAST(
-          COALESCE(
-            ST_Area(
-              ST_Intersection(
-                ST_MakeValid(ST_Buffer(ST_Transform(w.geom, 5179), 2.5)),
-                ST_MakeValid(
-                  ST_Transform(
-                    (SELECT geometry FROM shadow_union_20240731_1800 LIMIT 1),
-                    5179
-                  )
-                )
-              )
-            ) / NULLIF(
-              ST_Area(ST_MakeValid(ST_Buffer(ST_Transform(w.geom, 5179), 2.5))), 0
-            ),
-            0
-          ),
-          1.0
-        )),
-        0.1
-      ) AS cost,
-      GREATEST(
-        w.len_m * (1 - {COOL_WEIGHT} * LEAST(
-          COALESCE(
-            ST_Area(
-              ST_Intersection(
-                ST_MakeValid(ST_Buffer(ST_Transform(w.geom, 5179), 2.5)),
-                ST_MakeValid(
-                  ST_Transform(
-                    (SELECT geometry FROM shadow_union_20240731_1800 LIMIT 1),
-                    5179
-                  )
-                )
-              )
-            ) / NULLIF(
-              ST_Area(ST_MakeValid(ST_Buffer(ST_Transform(w.geom, 5179), 2.5))), 0
-            ),
-            0
-          ),
-          1.0
-        )),
-        0.1
-      ) AS reverse_cost
-    FROM ways_walk w
-    $q$,
-    (SELECT id FROM src), (SELECT id FROM dst), false
-  )
-),
-shortest_path AS (
-  SELECT ST_LineMerge(ST_Union(e.geom)) AS geom, SUM(e.len_m) AS total_m, AVG(e.shade_ratio) AS avg_shade_ratio
-  FROM shortest s JOIN edges e ON s.edge = e.id WHERE s.edge <> -1
-),
-coolest_path AS (
-  SELECT ST_LineMerge(ST_Union(e.geom)) AS geom, SUM(e.len_m) AS total_m, AVG(e.shade_ratio) AS avg_shade_ratio
-  FROM coolest c JOIN edges e ON c.edge = e.id WHERE c.edge <> -1
-)
-SELECT 'shortest' AS kind, ST_AsGeoJSON(geom) AS gj, total_m, avg_shade_ratio FROM shortest_path
-UNION ALL
-SELECT 'coolest'  AS kind, ST_AsGeoJSON(geom) AS gj, total_m, avg_shade_ratio FROM coolest_path;
-"""
-
+# ▶ edges_tmp(임시테이블) 생성 + pgr_dijkstra 실행 + 결과 취합
 def _fetch_routes(conn_dsn, src, dst):
-    with psycopg2.connect(conn_dsn) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(SQL_ROUTE, (src[0], src[1], dst[0], dst[1]))
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    conninfo = conn_dsn + "?application_name=shadi_route"
+    with psycopg2.connect(conninfo) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        # 안전장치
+        cur.execute("""
+            SET LOCAL statement_timeout = '60s';
+            SET LOCAL idle_in_transaction_session_timeout = '30s';
+            SET LOCAL jit = OFF;
+            SET LOCAL work_mem = '256MB';
+        """)
+
+        # 1) 코리도어+서브디바이드 적용하여 부분그래프 임시테이블 생성
+        cur.execute("""
+            DROP TABLE IF EXISTS edges_tmp;
+            CREATE TEMP TABLE edges_tmp AS
+            WITH
+            u5179 AS (
+              SELECT ST_Subdivide(
+                       ST_MakeValid(ST_Transform(geometry, 5179)),
+                       256
+                     ) AS g5179
+              FROM shadow_union_20240731_1800
+              LIMIT 1
+            ),
+            srcpt AS (SELECT ST_SetSRID(ST_Point(%s,%s), 4326) AS g4326),
+            dstpt AS (SELECT ST_SetSRID(ST_Point(%s,%s), 4326) AS g4326),
+            corridor AS (
+              SELECT ST_Buffer(
+                       ST_Transform(
+                         ST_MakeLine((SELECT g4326 FROM srcpt),(SELECT g4326 FROM dstpt)),
+                         5179
+                       ),
+                       600
+                     ) AS g5179
+            ),
+            edges AS (
+              SELECT
+                w.id, w.source, w.target, w.geom, w.len_m,
+                LEAST(
+                  COALESCE(
+                    SUM(
+                      ST_Area(
+                        ST_Intersection(
+                          ST_MakeValid(ST_Buffer(ST_Transform(w.geom, 5179), 2.5)),
+                          u.g5179
+                        )
+                      )
+                    ) / NULLIF(
+                      ST_Area(ST_MakeValid(ST_Buffer(ST_Transform(w.geom, 5179), 2.5))), 0
+                    ),
+                    0
+                  ),
+                  1.0
+                ) AS shade_ratio
+              FROM ways_walk w
+              JOIN corridor c
+                ON ST_Intersects(ST_Transform(w.geom, 5179), c.g5179)
+              LEFT JOIN u5179 u
+                ON ST_DWithin(ST_Transform(w.geom, 5179), u.g5179, 40)
+              GROUP BY w.id, w.source, w.target, w.geom, w.len_m
+            )
+            SELECT id, source, target, geom, len_m, shade_ratio
+            FROM edges;
+        """, (src[0], src[1], dst[0], dst[1]))
+
+        # 인덱스(빠른 조인/경로탐색)
+        cur.execute("CREATE INDEX IF NOT EXISTS edges_tmp_id_idx ON edges_tmp(id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS edges_tmp_st_idx ON edges_tmp(source, target);")
+
+        # 2) pgr_dijkstra 실행 + 결과 취합
+        sql_route = f"""
+        WITH
+        ok_v AS (
+          SELECT v.id, v.the_geom
+          FROM ways_raw_vertices_pgr v
+          JOIN (
+            SELECT source AS vid FROM ways_walk
+            UNION
+            SELECT target AS vid FROM ways_walk
+          ) ok ON ok.vid = v.id
+        ),
+        src AS (
+          SELECT id FROM ok_v
+          ORDER BY the_geom <-> ST_SetSRID(ST_Point(%s,%s), 4326)
+          LIMIT 1
+        ),
+        dst AS (
+          SELECT id FROM ok_v
+          ORDER BY the_geom <-> ST_SetSRID(ST_Point(%s,%s), 4326)
+          LIMIT 1
+        ),
+        shortest AS (
+          SELECT * FROM pgr_dijkstra(
+            $$SELECT id, source, target, len_m AS cost, len_m AS reverse_cost FROM edges_tmp$$,
+            (SELECT id FROM src), (SELECT id FROM dst), false
+          )
+        ),
+        coolest AS (
+          SELECT * FROM pgr_dijkstra(
+            $$SELECT
+                 id, source, target,
+                 GREATEST(len_m * (1 - {COOL_WEIGHT} * shade_ratio), 0.1) AS cost,
+                 GREATEST(len_m * (1 - {COOL_WEIGHT} * shade_ratio), 0.1) AS reverse_cost
+              FROM edges_tmp$$,
+            (SELECT id FROM src), (SELECT id FROM dst), false
+          )
+        ),
+        shortest_path AS (
+          SELECT ST_LineMerge(ST_Union(e.geom)) AS geom,
+                 SUM(e.len_m) AS total_m,
+                 AVG(e.shade_ratio) AS avg_shade_ratio
+          FROM shortest s
+          JOIN edges_tmp e ON s.edge = e.id
+          WHERE s.edge <> -1
+        ),
+        coolest_path AS (
+          SELECT ST_LineMerge(ST_Union(e.geom)) AS geom,
+                 SUM(e.len_m) AS total_m,
+                 AVG(e.shade_ratio) AS avg_shade_ratio
+          FROM coolest c
+          JOIN edges_tmp e ON c.edge = e.id
+          WHERE c.edge <> -1
+        )
+        SELECT 'shortest' AS kind, ST_AsGeoJSON(geom) AS gj, total_m, avg_shade_ratio FROM shortest_path
+        UNION ALL
+        SELECT 'coolest'  AS kind, ST_AsGeoJSON(geom) AS gj, total_m, avg_shade_ratio FROM coolest_path;
+        """
+        cur.execute(sql_route, (src[0], src[1], dst[0], dst[1]))
         rows = cur.fetchall()
+
+        # 선택: 세션 종료 시 TEMP은 자동 삭제되지만 명시적으로 정리하고 싶으면 아래 주석 해제
+        # cur.execute("DROP TABLE IF EXISTS edges_tmp;")
+
         return {r["kind"]: r for r in rows}
 
 PG_URL = "postgresql://postgres:804009@localhost:5432/shadi"
