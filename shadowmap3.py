@@ -120,8 +120,8 @@ print(f"    → 가로수 {len(trees_gdf):,} 개 (버퍼 범위)")
 tree_layers = []
 for _, r in trees_gdf.iterrows():
     lat, lon  = r["위도"], r["경도"]
-    h         = float(r.get("수고", 4))
-    crown_r   = h * 0.25
+    h         = 10.0
+    crown_r   = 3.0
     alt       = get_altitude(lat, lon, now)
     azi       = (get_azimuth(lat, lon, now) + 180) % 360
     poly      = tree_shadow_ellipse(lat, lon, crown_r, alt, azi)
