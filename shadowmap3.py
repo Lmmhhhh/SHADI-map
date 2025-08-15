@@ -85,7 +85,7 @@ def to_float_or_none(val):
 
 # ────────── 0. 충남대 3km 범위(사각) ──────────
 CENTER_CNU = (36.36917, 127.34515)  # (lat, lon)
-DIST_M     = 1000
+DIST_M     = 2000
 deg = DIST_M / 111_320
 buffer_rect = Polygon([
     (CENTER_CNU[1]-deg, CENTER_CNU[0]-deg),

@@ -212,11 +212,6 @@ def _fetch_routes(conn_dsn: str, src: tuple, dst: tuple, union_table: str, cool_
 
 def _fetch_shadow_any(conn_dsn: str, table_prefix: str, stamp: str,
                       bbox: tuple|None, simplify_tol_m: float = 0.7):
-    """
-    Return {"gj": <GeoJSON>, "count": N}
-    table_prefix ∈ {'shadow_union','shadow_building','shadow_tree','shadow_shelter'}
-    bbox: (minx,miny,maxx,maxy) EPSG:4326 or None
-    """
     table = _validate_table(table_prefix, stamp)
     conninfo = conn_dsn + "?application_name=shadi_shadow_srv"
     with psycopg2.connect(conninfo) as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -229,78 +224,125 @@ def _fetch_shadow_any(conn_dsn: str, table_prefix: str, stamp: str,
         if bbox:
             minx, miny, maxx, maxy = bbox
             q = f"""
-            WITH bb AS (
-              SELECT ST_MakeEnvelope(%s,%s,%s,%s,4326) AS env4326
-            ),
-            src AS (
-              SELECT ST_MakeValid(geometry) AS g4326
-              FROM {table}
-            ),
-            clip AS (
-              SELECT ST_Intersection(s.g4326, bb.env4326) AS g4326
-              FROM src s, bb
-              WHERE ST_Intersects(s.g4326, bb.env4326)
-            ),
-            fix AS (
-              SELECT ST_CollectionExtract(ST_Buffer(g4326, 0), 3) AS g4326
-              FROM clip
-              WHERE g4326 IS NOT NULL AND NOT ST_IsEmpty(g4326)
-            ),
-            simp AS (
-              SELECT ST_Transform(
-                       ST_Buffer(
-                         ST_SimplifyPreserveTopology(
-                           ST_SnapToGrid(ST_Transform(g4326, 5179), 0.05),
-                           %s
-                         ),
-                         0
-                       ),
-                       4326
-                     ) AS g4326
-              FROM fix
-            )
-            SELECT
-              ST_AsGeoJSON(ST_UnaryUnion(ST_Collect(g4326))) AS gj,
-              COUNT(*) AS cnt
-            FROM simp;
+            WITH bb AS (SELECT ST_MakeEnvelope(%s,%s,%s,%s,4326) AS env4326),
+                 src AS (SELECT ST_MakeValid(geometry) AS g4326 FROM {table}),
+                 clip AS (
+                   SELECT ST_Intersection(s.g4326, bb.env4326) AS g4326
+                   FROM src s, bb WHERE ST_Intersects(s.g4326, bb.env4326)
+                 ),
+                 fix AS (
+                   SELECT ST_CollectionExtract(ST_Buffer(g4326,0),3) AS g4326
+                   FROM clip WHERE g4326 IS NOT NULL AND NOT ST_IsEmpty(g4326)
+                 ),
+                 simp AS (
+                   SELECT ST_Buffer(
+                            ST_SimplifyPreserveTopology(
+                              ST_SnapToGrid(ST_Transform(g4326,5179),0.05),
+                              %s
+                            ), 0
+                          ) AS g5179
+                   FROM fix
+                 ),
+                 u AS (
+                   SELECT ST_Buffer(ST_UnaryUnion(ST_Collect(g5179)),0) AS g5179
+                   FROM simp
+                 )
+            SELECT ST_AsGeoJSON(ST_Transform(u.g5179,4326)) AS gj,
+                   (SELECT COUNT(*) FROM simp) AS cnt
+            FROM u;
             """
-            cur.execute(q, (minx, miny, maxx, maxy, simplify_tol_m))
+            try:
+                cur.execute(q, (minx, miny, maxx, maxy, simplify_tol_m))
+            except Exception:
+                # ★ 실패 시 트랜잭션 리셋 후 폴백 실행
+                conn.rollback()
+                cur.execute("""
+                    SET LOCAL statement_timeout = '60s';
+                    SET LOCAL jit = OFF;
+                    SET LOCAL work_mem = '256MB';
+                """)
+                q_fb = f"""
+                WITH bb AS (SELECT ST_MakeEnvelope(%s,%s,%s,%s,4326) AS env4326),
+                     src AS (SELECT ST_MakeValid(geometry) AS g4326 FROM {table}),
+                     clip AS (
+                       SELECT ST_Intersection(s.g4326, bb.env4326) AS g4326
+                       FROM src s, bb WHERE ST_Intersects(s.g4326, bb.env4326)
+                     ),
+                     fix AS (
+                       SELECT ST_CollectionExtract(ST_Buffer(g4326,0),3) AS g4326
+                       FROM clip WHERE g4326 IS NOT NULL AND NOT ST_IsEmpty(g4326)
+                     ),
+                     simp AS (
+                       SELECT ST_Buffer(
+                                ST_SimplifyPreserveTopology(
+                                  ST_SnapToGrid(ST_Transform(g4326,5179),0.05),
+                                  %s
+                                ), 0
+                              ) AS g5179
+                       FROM fix
+                     )
+                SELECT ST_AsGeoJSON(ST_Transform(ST_Collect(g5179),4326)) AS gj,
+                       COUNT(*) AS cnt
+                FROM simp;
+                """
+                cur.execute(q_fb, (minx, miny, maxx, maxy, simplify_tol_m))
         else:
             q = f"""
-            WITH src AS (
-              SELECT ST_MakeValid(geometry) AS g4326
-              FROM {table}
-            ),
-            fix AS (
-              SELECT ST_CollectionExtract(ST_Buffer(g4326, 0), 3) AS g4326
-              FROM src
-              WHERE g4326 IS NOT NULL AND NOT ST_IsEmpty(g4326)
-            ),
-            simp AS (
-              SELECT ST_Transform(
-                       ST_Buffer(
-                         ST_SimplifyPreserveTopology(
-                           ST_SnapToGrid(ST_Transform(g4326, 5179), 0.05),
-                           %s
-                         ),
-                         0
-                       ),
-                       4326
-                     ) AS g4326
-              FROM fix
-            )
-            SELECT
-              ST_AsGeoJSON(ST_UnaryUnion(ST_Collect(g4326))) AS gj,
-              COUNT(*) AS cnt
-            FROM simp;
+            WITH src AS (SELECT ST_MakeValid(geometry) AS g4326 FROM {table}),
+                 fix AS (
+                   SELECT ST_CollectionExtract(ST_Buffer(g4326,0),3) AS g4326
+                   FROM src WHERE g4326 IS NOT NULL AND NOT ST_IsEmpty(g4326)
+                 ),
+                 simp AS (
+                   SELECT ST_Buffer(
+                            ST_SimplifyPreserveTopology(
+                              ST_SnapToGrid(ST_Transform(g4326,5179),0.05),
+                              %s
+                            ), 0
+                          ) AS g5179
+                   FROM fix
+                 ),
+                 u AS (
+                   SELECT ST_Buffer(ST_UnaryUnion(ST_Collect(g5179)),0) AS g5179
+                   FROM simp
+                 )
+            SELECT ST_AsGeoJSON(ST_Transform(u.g5179,4326)) AS gj,
+                   (SELECT COUNT(*) FROM simp) AS cnt;
             """
-            cur.execute(q, (simplify_tol_m,))
+            try:
+                cur.execute(q, (simplify_tol_m,))
+            except Exception:
+                conn.rollback()
+                cur.execute("""
+                    SET LOCAL statement_timeout = '60s';
+                    SET LOCAL jit = OFF;
+                    SET LOCAL work_mem = '256MB';
+                """)
+                q_fb = f"""
+                WITH src AS (SELECT ST_MakeValid(geometry) AS g4326 FROM {table}),
+                     fix AS (
+                       SELECT ST_CollectionExtract(ST_Buffer(g4326,0),3) AS g4326
+                       FROM src WHERE g4326 IS NOT NULL AND NOT ST_IsEmpty(g4326)
+                     ),
+                     simp AS (
+                       SELECT ST_Buffer(
+                                ST_SimplifyPreserveTopology(
+                                  ST_SnapToGrid(ST_Transform(g4326,5179),0.05),
+                                  %s
+                                ), 0
+                              ) AS g5179
+                       FROM fix
+                     )
+                SELECT ST_AsGeoJSON(ST_Transform(ST_Collect(g5179),4326)) AS gj,
+                       COUNT(*) AS cnt
+                FROM simp;
+                """
+                cur.execute(q_fb, (simplify_tol_m,))
 
         row = cur.fetchone()
         gj = json.loads(row["gj"]) if row and row["gj"] else None
         cnt = int(row["cnt"]) if row and row["cnt"] is not None else 0
         return {"gj": gj, "count": cnt, "table": table}
-
 
 
 # ---------- Flask App ----------
