@@ -76,61 +76,66 @@ def _fetch_routes(conn_dsn: str, src: tuple, dst: tuple, union_table: str, cool_
         """)
 
         q_edges = f"""
-            DROP TABLE IF EXISTS edges_tmp;
-            CREATE TEMP TABLE edges_tmp AS
-            WITH
-            params AS (
-              SELECT 4.5::float8 AS shade_tol_m,
-                     150::float8 AS near_m,
-                     600::float8 AS corridor_m
+    DROP TABLE IF EXISTS edges_tmp;
+    CREATE TEMP TABLE edges_tmp AS
+    WITH
+    params AS (
+      SELECT 4.5::float8 AS shade_tol_m,
+             150::float8 AS near_m,
+             600::float8 AS corridor_m
+    ),
+    u5179 AS (
+      SELECT ST_Subdivide(
+               ST_MakeValid(ST_Transform(geometry, 5179)), 256
+             ) AS g5179
+      FROM {union_table}
+    ),
+    srcpt AS (SELECT ST_SetSRID(ST_Point(%s,%s), 4326) AS g4326),
+    dstpt AS (SELECT ST_SetSRID(ST_Point(%s,%s), 4326) AS g4326),
+    corridor AS (
+      SELECT ST_Buffer(
+               ST_Transform(
+                 ST_MakeLine((SELECT g4326 FROM srcpt),(SELECT g4326 FROM dstpt)),
+                 5179
+               ),
+               (SELECT corridor_m FROM params)
+             ) AS g5179
+    ),
+    -- ★ 코리도어와 실제로 교차하는 그늘조각만 사용
+    u_clip AS (
+      SELECT u.g5179
+      FROM u5179 u
+      JOIN corridor c ON ST_Intersects(u.g5179, c.g5179)
+    ),
+    edges AS (
+      SELECT
+        w.id, w.source, w.target, w.geom, w.len_m,
+        LEAST(
+          COALESCE(
+            SUM(
+              ST_Length(
+                ST_Intersection(
+                  ST_SnapToGrid(ST_Transform(w.geom, 5179), 0.05),
+                  ST_Buffer(u.g5179, (SELECT shade_tol_m FROM params))
+                )
+              )
+            ) / NULLIF(
+              ST_Length(ST_SnapToGrid(ST_Transform(w.geom, 5179), 0.05)), 0
             ),
-            u5179 AS (
-              SELECT ST_Subdivide(
-                       ST_MakeValid(ST_Transform(geometry, 5179)), 256
-                     ) AS g5179
-              FROM {union_table}
-              LIMIT 1
-            ),
-            srcpt AS (SELECT ST_SetSRID(ST_Point(%s,%s), 4326) AS g4326),
-            dstpt AS (SELECT ST_SetSRID(ST_Point(%s,%s), 4326) AS g4326),
-            corridor AS (
-              SELECT ST_Buffer(
-                       ST_Transform(
-                         ST_MakeLine((SELECT g4326 FROM srcpt),(SELECT g4326 FROM dstpt)),
-                         5179
-                       ),
-                       (SELECT corridor_m FROM params)
-                     ) AS g5179
-            ),
-            edges AS (
-              SELECT
-                w.id, w.source, w.target, w.geom, w.len_m,
-                LEAST(
-                  COALESCE(
-                    SUM(
-                      ST_Length(
-                        ST_Intersection(
-                          ST_SnapToGrid(ST_Transform(w.geom, 5179), 0.05),
-                          ST_Buffer(u.g5179, (SELECT shade_tol_m FROM params))
-                        )
-                      )
-                    ) / NULLIF(
-                      ST_Length(ST_SnapToGrid(ST_Transform(w.geom, 5179), 0.05)), 0
-                    ),
-                    0
-                  ),
-                  1.0
-                ) AS shade_ratio
-              FROM ways_raw w
-              JOIN corridor c
-                ON ST_Intersects(ST_Transform(w.geom, 5179), c.g5179)
-              LEFT JOIN u5179 u
-                ON ST_DWithin(ST_Transform(w.geom, 5179), u.g5179, (SELECT near_m FROM params))
-              GROUP BY w.id, w.source, w.target, w.geom, w.len_m
-            )
-            SELECT id, source, target, geom, len_m, shade_ratio
-            FROM edges;
-        """
+            0
+          ),
+          1.0
+        ) AS shade_ratio
+      FROM ways_raw w
+      JOIN corridor c
+        ON ST_Intersects(ST_Transform(w.geom, 5179), c.g5179)
+      LEFT JOIN u_clip u   -- ★ 여기도 u_clip으로
+        ON ST_DWithin(ST_Transform(w.geom, 5179), u.g5179, (SELECT near_m FROM params))
+      GROUP BY w.id, w.source, w.target, w.geom, w.len_m
+    )
+    SELECT id, source, target, geom, len_m, shade_ratio
+    FROM edges;
+"""
         cur.execute(q_edges, (src[0], src[1], dst[0], dst[1]))
         cur.execute("CREATE INDEX IF NOT EXISTS edges_tmp_id_idx ON edges_tmp(id);")
         cur.execute("CREATE INDEX IF NOT EXISTS edges_tmp_st_idx ON edges_tmp(source, target);")
