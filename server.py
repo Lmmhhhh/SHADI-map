@@ -431,7 +431,13 @@ MAP_HTML = r"""<!doctype html>
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 20, attribution: '&copy; OpenStreetMap'
   }).addTo(map);
-  L.Control.geocoder({defaultMarkGeocode: true, placeholder:"주소 검색"}).addTo(map);
+  // 주소 검색
+  const geocoder = L.Control.geocoder({
+    defaultMarkGeocode: true,
+    placeholder: "주소 검색",
+    position: "topleft",
+    collapsed: false      // ← 접지 않고 바로 인풋 표시
+  }).addTo(map);
 
   const srcIcon = new L.Icon({
     iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-green.png',
