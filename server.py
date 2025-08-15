@@ -433,6 +433,17 @@ MAP_HTML = r"""<!doctype html>
   }).addTo(map);
   L.Control.geocoder({defaultMarkGeocode: true, placeholder:"주소 검색"}).addTo(map);
 
+  const srcIcon = new L.Icon({
+    iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-green.png',
+    shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
+    iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34], shadowSize: [41, 41]
+  });
+  const dstIcon = new L.Icon({
+    iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png',
+    shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
+    iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34], shadowSize: [41, 41]
+  });
+
   let srcMarker=null, dstMarker=null, pickMode=null;
   let shortestLayer=null, coolestLayer=null;
   let shadowBuilding=null, shadowTree=null, shadowShelter=null;
@@ -448,12 +459,14 @@ MAP_HTML = r"""<!doctype html>
   }
   function setSrc(latlng){
     if(srcMarker) map.removeLayer(srcMarker);
-    srcMarker = L.marker(latlng,{title:"출발"}).addTo(map).bindTooltip("출발");
+    srcMarker = L.marker(latlng, {title:"출발", icon: srcIcon})
+                 .addTo(map).bindTooltip("출발");
     document.getElementById('src').value = llstr(latlng);
   }
   function setDst(latlng){
     if(dstMarker) map.removeLayer(dstMarker);
-    dstMarker = L.marker(latlng,{title:"도착"}).addTo(map).bindTooltip("도착");
+    dstMarker = L.marker(latlng, {title:"도착", icon: dstIcon})
+                 .addTo(map).bindTooltip("도착");
     document.getElementById('dst').value = llstr(latlng);
   }
   document.getElementById('pick-src').onclick = function(){ pickMode='src'; this.style.opacity=1; document.getElementById('pick-dst').style.opacity=.8; };
