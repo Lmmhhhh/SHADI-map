@@ -355,6 +355,24 @@ MAP_HTML = r"""<!doctype html>
         center: new kakao.maps.LatLng(36.36917, 127.34515), level: 4
       });
 
+      // ====== (추가) 커스텀 핀 이미지 정의: 출발=초록, 도착=빨강 ======
+      function pinSVG(fill){
+        return `<svg xmlns='http://www.w3.org/2000/svg' width='30' height='42' viewBox='0 0 30 42'>
+          <path fill='${fill}' d='M15 0c-7.2 0-13 5.8-13 13 0 9.5 13 29 13 29s13-19.5 13-29C28 5.8 22.2 0 15 0z'/>
+          <circle cx='15' cy='13' r='5' fill='#fff'/>
+        </svg>`;
+      }
+      function makePin(color){
+        return new kakao.maps.MarkerImage(
+          'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(pinSVG(color)),
+          new kakao.maps.Size(30, 42),
+          { offset: new kakao.maps.Point(15, 42) }
+        );
+      }
+      const SRC_PIN = makePin('#2ecc71'); // 초록
+      const DST_PIN = makePin('#e74c3c'); // 빨강
+      // ==========================================================
+
       // state
       let srcMarker=null, dstMarker=null, pickMode=null;
       let srcLL=null, dstLL=null;
@@ -375,14 +393,20 @@ MAP_HTML = r"""<!doctype html>
       }
       function setSrcByLatLng(lat, lng){
         if(srcMarker) srcMarker.setMap(null);
-        srcMarker = new kakao.maps.Marker({ position: new kakao.maps.LatLng(lat, lng) });
+        srcMarker = new kakao.maps.Marker({
+          position: new kakao.maps.LatLng(lat, lng),
+          image: SRC_PIN                      // ← 초록 핀
+        });
         srcMarker.setMap(map);
         const el=$('src'); if(el) el.value = llstrLL(lat, lng);
         srcLL = {lat, lng};
       }
       function setDstByLatLng(lat, lng){
         if(dstMarker) dstMarker.setMap(null);
-        dstMarker = new kakao.maps.Marker({ position: new kakao.maps.LatLng(lat, lng) });
+        dstMarker = new kakao.maps.Marker({
+          position: new kakao.maps.LatLng(lat, lng),
+          image: DST_PIN                      // ← 빨강 핀
+        });
         dstMarker.setMap(map);
         const el=$('dst'); if(el) el.value = llstrLL(lat, lng);
         dstLL = {lat, lng};
