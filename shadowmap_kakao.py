@@ -43,16 +43,45 @@ def _parse_coord_pair(s: str):
         lon, lat = a, b  # "lon,lat"
     return (lon, lat)
 
-def _stamp_from_time(t: str|None) -> str:
-    """'YYYY-MM-DDTHH:MM' → 'YYYYMMDD_HHMM'"""
+def _stamp_from_time(t: str | None) -> str:
+    """수신된 time 문자열을 'YYYYMMDD_HHMM'으로 변환.
+       지원 형식:
+         - 'YYYY-MM-DDTHH:MM'
+         - 'YYYY-MM-DD HH:MM'
+         - 'YYYY-MM-DD 오후 06:00' / 'YYYY-MM-DD 오전 06:00'
+         - ISO-like 문자열(가능하면 fromisoformat 사용)
+       실패 시 기존 DEFAULT_STAMP 반환.
+    """
     if not t:
         return DEFAULT_STAMP
+
+    s = t.strip().replace("T", " ").replace("/", "-")
+
+    # 1) 24시간제 'YYYY-MM-DD HH:MM'
     try:
-        t = t.replace("T", " ").strip()
-        dt = datetime.datetime.strptime(t, "%Y-%m-%d %H:%M")
+        dt = datetime.datetime.strptime(s, "%Y-%m-%d %H:%M")
+        return dt.strftime("%Y%m%d_%H%M")
+    except Exception:
+        pass
+
+    # 2) 한글 AM/PM 'YYYY-MM-DD 오전/오후 HH:MM'
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})\s*(오전|오후)\s*(\d{1,2}):(\d{2})$", s)
+    if m:
+        date, ap, hh, mm = m.group(1), m.group(2), int(m.group(3)), int(m.group(4))
+        if ap == "오후" and hh < 12:
+            hh += 12
+        if ap == "오전" and hh == 12:
+            hh = 0
+        dt = datetime.datetime.strptime(f"{date} {hh:02d}:{mm:02d}", "%Y-%m-%d %H:%M")
+        return dt.strftime("%Y%m%d_%H%M")
+
+    # 3) 그 외 ISO 유사 포맷 시도
+    try:
+        dt = datetime.datetime.fromisoformat(s)
         return dt.strftime("%Y%m%d_%H%M")
     except Exception:
         return DEFAULT_STAMP
+
 
 def _validate_table(prefix: str, stamp: str) -> str:
     """prefix in {'shadow_union','shadow_building','shadow_tree','shadow_shelter'}"""
@@ -76,19 +105,20 @@ def _fetch_routes(conn_dsn: str, src: tuple, dst: tuple, union_table: str, cool_
         """)
 
         q_edges = f"""
-    DROP TABLE IF EXISTS edges_tmp;
-    CREATE TEMP TABLE edges_tmp AS
-    WITH
-    params AS (
-      SELECT 4.5::float8 AS shade_tol_m,
-             150::float8 AS near_m,
-             600::float8 AS corridor_m
-    ),
-    u5179 AS (
-      SELECT ST_Subdivide(
-               ST_MakeValid(ST_Transform(geometry, 5179)), 256
-             ) AS g5179
-      FROM {union_table}
+DROP TABLE IF EXISTS edges_tmp;
+CREATE TEMP TABLE edges_tmp AS
+WITH
+params AS (
+  SELECT 4.5::float8 AS shade_tol_m,   -- 그림자 여유(m)
+         120::float8 AS near_m,        -- (남겨두었지만 아래 쿼리에선 사용X)
+         250::float8 AS corridor_m     -- 코리도어 폭(줄일수록 빠름)
+),
+-- 1) 전체 그림자를 5179로 만들고 유니온 후 잘게 쪼개기
+u5179 AS (
+  SELECT ST_Subdivide(
+           ST_UnaryUnion(ST_MakeValid(ST_Transform(geometry, 5179))), 256
+         ) AS g5179
+  FROM {union_table}
     ),
     srcpt AS (SELECT ST_SetSRID(ST_Point(%s,%s), 4326) AS g4326),
     dstpt AS (SELECT ST_SetSRID(ST_Point(%s,%s), 4326) AS g4326),
@@ -436,6 +466,7 @@ MAP_HTML = r"""<!doctype html>
 
       // markers & layers
       let srcMarker=null, dstMarker=null, pickMode=null;
+      let srcLL=null, dstLL=null;
       let shortestPolyline=null, coolestPolyline=null;
       let shadowBuilding=[], shadowTree=[], shadowShelter=[];
 
@@ -454,12 +485,14 @@ MAP_HTML = r"""<!doctype html>
         srcMarker = new kakao.maps.Marker({ position: new kakao.maps.LatLng(lat, lng) });
         srcMarker.setMap(map);
         document.getElementById('src').value = llstrLL(lat, lng);
+        srcLL = {lat, lng};
       }
       function setDstByLatLng(lat, lng){
         if(dstMarker) dstMarker.setMap(null);
         dstMarker = new kakao.maps.Marker({ position: new kakao.maps.LatLng(lat, lng) });
         dstMarker.setMap(map);
         document.getElementById('dst').value = llstrLL(lat, lng);
+        dstLL = {lat, lng};
       }
 
       document.getElementById('pick-src').onclick = function(){ pickMode='src'; this.style.opacity=1; document.getElementById('pick-dst').style.opacity=.8; };
@@ -484,14 +517,14 @@ MAP_HTML = r"""<!doctype html>
       });
 
       document.getElementById('run').onclick = async function(){
-        const s = toLonLat(document.getElementById('src').value);
-        const d = toLonLat(document.getElementById('dst').value);
+        let s = srcLL ? [srcLL.lng, srcLL.lat] : toLonLat(document.getElementById('src').value);
+        let d = dstLL ? [dstLL.lng, dstLL.lat] : toLonLat(document.getElementById('dst').value);
         const t = document.getElementById('time').value;
         if(!s || !d){ alert("좌표 형식이 올바르지 않습니다. 예: 36.361738, 127.344776"); return; }
         const qs = new URLSearchParams({
-          src: s[1].toFixed(6)+","+s[0].toFixed(6),
-          dst: d[1].toFixed(6)+","+d[0].toFixed(6),
-          time: t || ""
+            src: `${s[1]},${s[0]}`,   // "lat,lon"
+            dst: `${d[1]},${d[0]}`,
+            time: t || ""
         }).toString();
 
         document.getElementById('run').disabled = true;
