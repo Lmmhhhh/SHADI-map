@@ -10,7 +10,7 @@ import numpy as np
 
 # ────────────────────────────── 기본 설정 ──────────────────────────────
 tz   = pytz.timezone("Asia/Seoul")
-now  = tz.localize(datetime.datetime(2024, 7, 31, 18, 0, 0))   # 분석 시각
+now  = tz.localize(datetime.datetime(2025, 7, 20, 18, 0, 0))   # 분석 시각
 WIDTH_RATIO_TREE = 3.0
 proj = Transformer.from_crs(4326, 5179, always_xy=True)
 warnings.filterwarnings("ignore", message="I don't know about leap seconds")
@@ -86,7 +86,7 @@ def to_float_or_none(val):
 
 # ────────── 0. 충남대 3km 범위(사각) ──────────
 CENTER_CNU = (36.36917, 127.34515)  # (lat, lon)
-DIST_M     = 3000
+DIST_M     = 1000
 deg = DIST_M / 111_320
 buffer_rect = Polygon([
     (CENTER_CNU[1]-deg, CENTER_CNU[0]-deg),
@@ -282,34 +282,34 @@ gdf_tree     = gpd.GeoDataFrame(geometry=[g for g, _ in tree_layers], crs="EPSG:
 gdf_shelter  = gpd.GeoDataFrame(geometry=[g for g, _ in shel_layers], crs="EPSG:4326")
 
 print("  • DB 저장 예정(건물/나무/쉼터):", len(gdf_building), len(gdf_tree), len(gdf_shelter))
-gdf_building.to_postgis("shadow_building_20240731_1800", engine, if_exists="replace", index=False)
-gdf_tree.to_postgis("shadow_tree_20240731_1800", engine, if_exists="replace", index=False)
-gdf_shelter.to_postgis("shadow_shelter_20240731_1800", engine, if_exists="replace", index=False)
+gdf_building.to_postgis("shadow_building_20250720_1800", engine, if_exists="replace", index=False)
+gdf_tree.to_postgis("shadow_tree_20250720_1800", engine, if_exists="replace", index=False)
+gdf_shelter.to_postgis("shadow_shelter_20250720_1800", engine, if_exists="replace", index=False)
 
 with engine.begin() as conn:
     conn.execute(text("""
-        CREATE INDEX IF NOT EXISTS shadow_building_20240731_1800_gix
-          ON shadow_building_20240731_1800 USING GIST (geometry);
-        CREATE INDEX IF NOT EXISTS shadow_tree_20240731_1800_gix
-          ON shadow_tree_20240731_1800 USING GIST (geometry);
-        CREATE INDEX IF NOT EXISTS shadow_shelter_20240731_1800_gix
-          ON shadow_shelter_20240731_1800 USING GIST (geometry);
+        CREATE INDEX IF NOT EXISTS shadow_building_20250720_1800_gix
+          ON shadow_building_20250720_1800 USING GIST (geometry);
+        CREATE INDEX IF NOT EXISTS shadow_tree_20250720_1800_gix
+          ON shadow_tree_20250720_1800 USING GIST (geometry);
+        CREATE INDEX IF NOT EXISTS shadow_shelter_20250720_1800_gix
+          ON shadow_shelter_20250720_1800 USING GIST (geometry);
     """))
-    conn.execute(text("DROP TABLE IF EXISTS shadow_union_20240731_1800;"))
+    conn.execute(text("DROP TABLE IF EXISTS shadow_union_20250720_1800;"))
     conn.execute(text("""
-        CREATE TABLE shadow_union_20240731_1800 AS
+        CREATE TABLE shadow_union_20250720_1800 AS
         SELECT ST_UnaryUnion(geometry) AS geometry
         FROM (
-          SELECT geometry FROM shadow_building_20240731_1800
+          SELECT geometry FROM shadow_building_20250720_1800
           UNION ALL
-          SELECT geometry FROM shadow_tree_20240731_1800
+          SELECT geometry FROM shadow_tree_20250720_1800
           UNION ALL
-          SELECT geometry FROM shadow_shelter_20240731_1800
+          SELECT geometry FROM shadow_shelter_20250720_1800
         ) s;
     """))
     conn.execute(text("""
-        CREATE INDEX IF NOT EXISTS shadow_union_20240731_1800_gix
-          ON shadow_union_20240731_1800 USING GIST (geometry);
+        CREATE INDEX IF NOT EXISTS shadow_union_20250720_1800_gix
+          ON shadow_union_20250720_1800 USING GIST (geometry);
     """))
 
 print("PostGIS 저장 및 UNION 테이블 생성 완료")
@@ -317,14 +317,14 @@ print("PostGIS 저장 및 UNION 테이블 생성 완료")
 # 5) 경로 산출(ways_walk 사용)
 import psycopg2
 from psycopg2.extras import RealDictCursor
-SRC = (127.344209,36.361742)   # (lon, lat)
-DST = (127.345119, 36.355308)  # (lon, lat)
+SRC = (127.345658,36.364793)  # (lon, lat)
+DST = (127.341099, 36.367891) # (lon, lat)
 COOL_WEIGHT = 0.8
 
 SQL_ROUTE = f"""
 WITH
 u AS (
-  SELECT geometry FROM shadow_union_20240731_1800 LIMIT 1
+  SELECT geometry FROM shadow_union_20250720_1800 LIMIT 1
 ),
 edges AS (
   SELECT
@@ -382,7 +382,7 @@ coolest AS (
           / NULLIF(ST_Length(w.geom::geography), 0), 0
         ) AS shade_ratio
       FROM ways_walk w
-      LEFT JOIN shadow_union_20240731_1800 su
+      LEFT JOIN shadow_union_20250720_1800 su
         ON ST_Intersects(w.geom, su.geometry)
     ) in_edges
     $q$,
